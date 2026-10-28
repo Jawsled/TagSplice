@@ -152,7 +152,6 @@ def main() -> int:
 # ===========================================================================
 
 sys.path.insert(0, str(PROJECT_DIR))
-import tagsplice  # noqa: E402
 
 QT_ERROR: Exception | None = None
 
@@ -977,6 +976,12 @@ def _tk_main() -> int:
 # ---------------------------------------------------------------------------
 
 def gui_main() -> int:
+    # Imported here (not at module level) so the `cli` subcommand still
+    # works on a host interpreter that doesn't have mutagen yet.
+    # `global` makes the name visible to _qt_main / TkApp below.
+    global tagsplice
+    import tagsplice  # noqa: F401
+
     if _try_qt():
         return _qt_main()
     if _try_tk():

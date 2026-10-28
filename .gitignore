@@ -2,3 +2,6 @@
 __pycache__
 overrides.json
 Musicbee
+test_venv.py
+clean_venv.py
+*.bat
