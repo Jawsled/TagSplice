@@ -7,10 +7,13 @@ Normalizations:
     one per artist, with title-cased names (overrides + str.title() fallback).
   * ALBUMARTIST: when multiple artists are listed, join them with " ; "
     (the standard multi-value separator for album-artist groupings).
-  * TITLE feat. extraction (OPTIONAL, off by default): move
+  * DISPLAY ARTIST: default to "A, B & C" notation, rebuilt when the
+    stored value still contains raw ";" / "//" separators.
+  * TITLE credit extraction (OPTIONAL, off by default): move
     "(feat. X)" / "(ft. X)" / "[feat. X]" suffixes from TITLE into
-    ARTIST (as extra values) and DISPLAY ARTIST ("Primary feat. X"),
-    and strip the suffix from TITLE. Enable with
+    ARTIST and DISPLAY ARTIST and strip them from TITLE. Remix credits
+    like "(DJ X Remix)" / "[DJ X Remix]" only fill REMIXER (TPE4 for
+    MP3); the TITLE and DISPLAY ARTIST are left untouched. Enable with
     `--extract-feat-from-title` (CLI) or the GUI checkbox.
 
 Usage:
@@ -28,7 +31,9 @@ import sys
 from pathlib import Path
 
 from mutagen.flac import FLAC
-from mutagen.id3 import ID3
+from mutagen.id3 import (
+    ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TPE4, TRCK, TSOP, TXXX,
+)
 from mutagen.mp3 import MP3
 from mutagen.oggvorbis import OggVorbis
 
@@ -51,12 +56,117 @@ TITLE_FEAT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Parenthesized/bracketed remix credit inside TITLE, e.g.
+#   "Song (DJ X Remix)", "Song [DJ X Rmx]", or "Song - DJ Y Remix".
+TITLE_REMIX_RE = re.compile(
+    r"\s*[\(\[]\s*([^\)\]]*?(?:remix|rmx)[^\)\]]*?)\s*[\)\]]",
+    re.IGNORECASE,
+)
+# Trailing "Song - DJ X Remix" form.
+TITLE_REMIX_DASH_RE = re.compile(
+    r"\s+[-–—]\s+([^-–—\(\)\[\]]*?(?:remix|rmx)"
+    r"[^-–—\(\)\[\]]*?)\s*$",
+    re.IGNORECASE,
+)
+REMIX_WORD_RE = re.compile(r"\b(?:remix|rmx)\b", re.IGNORECASE)
+REMIX_BY_RE = re.compile(
+    r"^(?:the\s+)?remix\s+by\s+(.+)$", re.IGNORECASE)
 
-def load_overrides(path: Path = OVERRIDES_PATH) -> dict[str, str]:
+# Credit words that describe a remix type rather than a remixer.
+REMIX_GENERIC_WORDS = {
+    "remix", "rmx", "mix", "edit", "version", "extended", "radio",
+    "club", "dub", "vocal", "instrumental", "original", "album",
+    "single", "short", "long", "main", "bonus", "bootleg", "mashup",
+    "acoustic", "live", "demo", "nightcore", "slowed", "reverb",
+    "lofi", "lo-fi", "the", "a", "an",
+}
+
+# Logical tag name -> ID3 frame for writing. Vorbis tags use the
+# logical name directly. DISPLAY ARTIST etc. are stored in TXXX frames.
+ID3_TEXT_FRAMES = {
+    "TITLE": ("TIT2", TIT2),
+    "ARTIST": ("TPE1", TPE1),
+    "ALBUMARTIST": ("TPE2", TPE2),
+    "REMIXER": ("TPE4", TPE4),
+    "ALBUM": ("TALB", TALB),
+    "DATE": ("TDRC", TDRC),
+    "GENRE": ("TCON", TCON),
+    "TRACKNUMBER": ("TRCK", TRCK),
+    "ARTISTSORT": ("TSOP", TSOP),
+}
+ID3_TXXX_TAGS = {"DISPLAY ARTIST", "ARTISTS", "ALBUMARTISTS"}
+
+
+def load_override_rules(path: Path = OVERRIDES_PATH) -> dict[str, str]:
+    """Load override rules exactly as stored (key casing preserved).
+
+    Returns {} when the file does not exist. Raises ValueError when the
+    file cannot be read or is not a JSON object of "artist": "display"
+    pairs, so the GUI can explain why rules are not being applied.
+    """
     if not path.exists():
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return {k.lower(): v for k, v in data.items()}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path} must contain a JSON object of "
+            '"artist": "display" pairs.')
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def load_overrides(path: Path = OVERRIDES_PATH) -> dict[str, str]:
+    """Load overrides keyed by lowercased artist name for matching."""
+    return {k.lower(): v for k, v in load_override_rules(path).items()}
+
+
+def save_override_rules(rules: dict[str, str],
+                        path: Path = OVERRIDES_PATH) -> None:
+    """Write `rules` to `path` as a plain JSON object.
+
+    The file stays hand-editable and usable by the CLI. Blank rows are
+    dropped; a rule missing either side, or a duplicate (case-insensitive)
+    artist name, raises ValueError. The write is atomic.
+    """
+    clean: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    for raw_key, raw_value in rules.items():
+        key = str(raw_key).strip()
+        value = str(raw_value).strip()
+        if not key and not value:
+            continue
+        if not key or not value:
+            raise ValueError(
+                f'Rule for "{key or value}" needs both an artist and a '
+                "display name.")
+        lowered = key.lower()
+        if lowered in seen:
+            raise ValueError(
+                f'Duplicate rule for "{key}" (already set by '
+                f'"{seen[lowered]}"); matching ignores case.')
+        seen[lowered] = key
+        clean[key] = value
+    payload = dict(sorted(clean.items(), key=lambda kv: kv[0].lower()))
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _split_on_separators(text: str) -> list[str]:
+    """Split a raw credit on '//', ';', '&' and ',', dropping empties."""
+    out: list[str] = []
+    for piece in EDIT_SEP_RE.split(text):
+        for piece in SEMICOLON_RE.split(piece):
+            for piece in AMP_RE.split(piece):
+                for piece in COMMA_RE.split(piece):
+                    piece = piece.strip()
+                    if piece:
+                        out.append(piece)
+    return out
 
 
 def split_artists(artist_field: str) -> list[str]:
@@ -69,22 +179,39 @@ def split_artists(artist_field: str) -> list[str]:
     """
     # Split feat. off first so 'A feat. B & C' -> ['A', 'B & C'].
     parts = FEAT_RE.split(artist_field, maxsplit=1)
-    if len(parts) == 2:
-        primary, featured = parts
-        chunks = [primary, featured]
-    else:
-        chunks = [parts[0]]
-    # Then split every chunk on //, ;, & and comma.
     out: list[str] = []
-    for chunk in chunks:
-        for piece in EDIT_SEP_RE.split(chunk):
-            for piece in SEMICOLON_RE.split(piece):
-                for piece in AMP_RE.split(piece):
-                    for piece in COMMA_RE.split(piece):
-                        piece = piece.strip()
-                        if piece:
-                            out.append(piece)
+    for chunk in parts:
+        out.extend(_split_on_separators(chunk))
     return out or [artist_field]
+
+
+def split_feat(artist_field: str) -> tuple[list[str], list[str]]:
+    """Split an ARTIST value into (primary_names, featured_names)."""
+    parts = FEAT_RE.split(artist_field, maxsplit=1)
+    primary = _split_on_separators(parts[0])
+    featured = _split_on_separators(parts[1]) if len(parts) == 2 else []
+    return primary, featured
+
+
+def join_display(names: list[str]) -> str:
+    """Join names as 'A', 'A & B', or 'A, B & C'."""
+    clean = [n.strip() for n in names if n and n.strip()]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} & {clean[1]}"
+    return ", ".join(clean[:-1]) + f" & {clean[-1]}"
+
+
+def format_display(primary: list[str], featured: list[str] | None = None) -> str:
+    """Build a display credit: 'A, B & C feat. X & Y' (featured last)."""
+    base = join_display(primary)
+    if featured:
+        feat_text = join_display(featured)
+        base = f"{base} feat. {feat_text}" if base else f"feat. {feat_text}"
+    return base
 
 
 # Separator users type into the editable After cell.
@@ -119,6 +246,50 @@ def extract_title_feat(title: str) -> tuple[str, list[str]]:
     return cleaned, featured
 
 
+def _remixers_from_credit(credit: str) -> list[str]:
+    """Pull remixer names out of a single remix credit.
+
+    'DJ X Remix' -> ['DJ X']; 'Extended Remix' -> [] (a remix type,
+    not a remixer); 'Remix by DJ X' -> ['DJ X'].
+    """
+    by_match = REMIX_BY_RE.match(credit.strip())
+    source = by_match.group(1) if by_match else credit
+    names: list[str] = []
+    for chunk in _split_on_separators(source):
+        chunk = REMIX_WORD_RE.split(chunk, maxsplit=1)[0]
+        chunk = chunk.strip(" -–—,;:&").strip()
+        chunk = re.sub(r"['’]s$", "", chunk, flags=re.IGNORECASE).strip()
+        if chunk and chunk.lower() not in REMIX_GENERIC_WORDS:
+            names.append(chunk)
+    return names
+
+
+def extract_title_remix(title: str) -> list[str]:
+    """Collect remixer names from remix credits in a TITLE.
+
+    Unlike feat. credits, remix credits stay in TITLE (they are part of
+    the track name) and are not added to DISPLAY ARTIST. Both
+    parenthesized and bracketed forms are recognized, and the title is
+    never modified.
+    """
+    credits: list[str] = []
+
+    def collect(match: re.Match) -> None:
+        credit = re.sub(r"\s+", " ", match.group(1)).strip()
+        if credit:
+            credits.append(credit)
+
+    for match in TITLE_REMIX_RE.finditer(title):
+        collect(match)
+    for match in TITLE_REMIX_DASH_RE.finditer(title):
+        collect(match)
+
+    remixers: list[str] = []
+    for credit in credits:
+        remixers.extend(_remixers_from_credit(credit))
+    return remixers
+
+
 def parse_edit_value(text: str) -> list[str]:
     """Parse user-typed text back into a list of tag values.
 
@@ -147,20 +318,92 @@ def open_audio(path: Path):
     return None
 
 
+def _id3_encoding(tags: ID3) -> int:
+    """UTF-8 on ID3v2.4, UTF-16 (v2.3-compatible) otherwise."""
+    return 3 if getattr(tags, "version", (2, 4)) >= (2, 4) else 1
+
+
+def get_tag_values(audio, key: str) -> list[str]:
+    """Read a logical tag (ARTIST, DISPLAY ARTIST, REMIXER, ...)."""
+    tags = audio.tags
+    if tags is None:
+        return []
+    if isinstance(tags, ID3):
+        if key in ID3_TXXX_TAGS:
+            frame = tags.get(f"TXXX:{key}")
+        else:
+            spec = ID3_TEXT_FRAMES.get(key)
+            frame_id = spec[0] if spec else f"TXXX:{key}"
+            frame = tags.get(frame_id)
+        if frame is None:
+            return []
+        return [str(v) for v in getattr(frame, "text", [])]
+    return [str(v) for v in tags.get(key, [])]
+
+
+def set_tag_values(audio, key: str, values: list[str]) -> None:
+    """Write a logical tag, mapping to TPE1/TPE4/TXXX on ID3."""
+    tags = audio.tags
+    if tags is None:
+        return
+    values = [str(v) for v in values]
+    if isinstance(tags, ID3):
+        encoding = _id3_encoding(tags)
+        if key in ID3_TXXX_TAGS:
+            tags.delall(f"TXXX:{key}")
+            if values:
+                tags.add(TXXX(encoding=encoding, desc=key, text=values))
+            return
+        spec = ID3_TEXT_FRAMES.get(key)
+        if spec is None:
+            tags.delall(f"TXXX:{key}")
+            if values:
+                tags.add(TXXX(encoding=encoding, desc=key, text=values))
+            return
+        frame_id, frame_cls = spec
+        tags.delall(frame_id)
+        if values:
+            tags.add(frame_cls(encoding=encoding, text=values))
+        return
+    tags[key] = values
+
+
+def delete_tag(audio, key: str) -> None:
+    tags = audio.tags
+    if tags is None:
+        return
+    if isinstance(tags, ID3):
+        spec = ID3_TEXT_FRAMES.get(key)
+        if key in ID3_TXXX_TAGS or spec is None:
+            tags.delall(f"TXXX:{key}")
+        else:
+            tags.delall(spec[0])
+        return
+    if key in tags:
+        del tags[key]
+
+
 def read_tags(audio) -> dict[str, list[str]]:
     """Return tag -> [values] for the keys we care about.
 
-    Vorbis tags are case-insensitive, so we normalize keys to uppercase.
+    ID3 files are mapped from frames (TPE1, TPE4, TXXX:...) to logical
+    names; Vorbis keys are case-insensitive and normalized to uppercase.
     """
     out: dict[str, list[str]] = {}
+    if isinstance(audio.tags, ID3):
+        for key in (*ID3_TEXT_FRAMES, *sorted(ID3_TXXX_TAGS)):
+            values = get_tag_values(audio, key)
+            if values:
+                out[key] = values
+        return out
+
     keys = {"artist", "albumartist", "artists", "display artist",
             "albumartists", "album_artist", "artists_credit", "artist_credit",
-            "artists_sort", "artistsort",
+            "artists_sort", "artistsort", "remixer",
             "album", "title", "date", "genre", "tracknumber"}
     try:
         items = audio.tags.items()
     except AttributeError:
-        # ID3 fallback
         items = audio.tags
     for k, v in items:
         if k.lower() in keys:
@@ -180,7 +423,8 @@ def print_view(path: Path) -> None:
 
     print(f"\n{path}")
     tags = read_tags(audio)
-    for key in ("TITLE", "ARTIST", "DISPLAY ARTIST", "ALBUMARTIST", "ARTISTS",
+    for key in ("TITLE", "ARTIST", "DISPLAY ARTIST", "REMIXER",
+                "ALBUMARTIST", "ARTISTS",
                 "ALBUM", "DATE", "GENRE", "TRACKNUMBER"):
         if key in tags:
             for v in tags[key]:
@@ -192,55 +436,69 @@ def plan_changes(audio, overrides: dict[str, str],
                  extract_feat_from_title: bool = False) -> dict | None:
     """Return a dict of planned tag edits, or None if no changes needed.
 
-    When `extract_feat_from_title` is True, a parenthesized
-    "(feat. X)"/"(ft. X)" credit in TITLE is moved into ARTIST (as
-    extra values) and DISPLAY ARTIST ("Primary feat. X"), and the
-    suffix is stripped from TITLE. Off by default.
+    When `extract_feat_from_title` is True, parenthesized
+    "(feat. X)"/"(ft. X)" credits in TITLE are moved into ARTIST and
+    DISPLAY ARTIST and stripped from TITLE. Remix credits such as
+    "(DJ X Remix)"/"[DJ X Remix]" only set REMIXER: the TITLE and
+    DISPLAY ARTIST are left untouched. Off by default.
     """
     if audio.tags is None:
         return None
 
-    artist_values = list(audio.tags.get("ARTIST", []))
+    artist_values = get_tag_values(audio, "ARTIST")
     if not artist_values:
         return None
 
-    # If ARTIST already has multiple values, only re-case each entry —
-    # don't re-split. This keeps the script idempotent.
+    # Split feat. credits from ARTIST. A single value is fully split on
+    # in-band separators; existing multi-value ARTIST tags are treated
+    # as already split so group names like "Simon & Garfunkel" survive.
+    primary_parts: list[str] = []
+    artist_featured: list[str] = []
     if len(artist_values) == 1:
-        original_display = artist_values[0]
-        parts = split_artists(original_display)
+        primary_parts, artist_featured = split_feat(artist_values[0])
     else:
-        # Already split: preserve the original display string from
-        # DISPLAY ARTIST if present, otherwise reconstruct one.
-        original_display = list(audio.tags.get("DISPLAY ARTIST", []))
-        if len(original_display) == 1:
-            original_display = original_display[0]
-        else:
-            original_display = artist_values[0]
-        parts = list(artist_values)
+        for value in artist_values:
+            parts = FEAT_RE.split(value, maxsplit=1)
+            primary = parts[0].strip()
+            if primary:
+                primary_parts.append(primary)
+            if len(parts) == 2:
+                artist_featured.extend(_split_on_separators(parts[1]))
 
-    new_artist_values = [format_artist(p, overrides) for p in parts]
+    formatted_primary = [format_artist(p, overrides) for p in primary_parts]
+    formatted_featured = [format_artist(n, overrides) for n in artist_featured]
+    new_artist_values = [*formatted_primary, *formatted_featured]
+    if not new_artist_values:
+        return None
 
-    # --- Optional: extract "(feat. X)" from TITLE ---------------------
+    # --- Optional: extract feat./remix credits from TITLE -------------
     new_title_values: list[str] | None = None
-    title_featured_fmt: list[str] = []
+    title_featured: list[str] = []
+    remixer_fmt: list[str] = []
     if extract_feat_from_title:
-        title_values = list(audio.tags.get("TITLE", []))
+        title_values = get_tag_values(audio, "TITLE")
         if title_values:
-            cleaned, featured_raw = extract_title_feat(title_values[0])
+            original_title = title_values[0]
+            cleaned, featured_raw = extract_title_feat(original_title)
+            # Remix credits are read from the untouched title and only
+            # feed REMIXER; they stay in TITLE and out of DISPLAY ARTIST.
+            remixer_raw = extract_title_remix(original_title)
             if featured_raw:
-                title_featured_fmt = [
+                title_featured = [
                     format_artist(n, overrides) for n in featured_raw
                 ]
                 # Append featured artists missing from ARTIST
                 # (case-insensitive de-dupe, preserve order).
                 seen = {p.lower() for p in new_artist_values}
-                for feat in title_featured_fmt:
+                for feat in title_featured:
                     if feat.lower() not in seen:
                         seen.add(feat.lower())
                         new_artist_values.append(feat)
-                if cleaned != title_values[0]:
-                    new_title_values = [cleaned, *title_values[1:]]
+            if remixer_raw:
+                remixer_fmt = [format_artist(n, overrides)
+                               for n in remixer_raw]
+            if cleaned != original_title:
+                new_title_values = [cleaned, *title_values[1:]]
 
     changes: dict[str, list[str]] = {}
 
@@ -248,28 +506,48 @@ def plan_changes(audio, overrides: dict[str, str],
         changes["ARTIST"] = new_artist_values
 
     # DISPLAY ARTIST (with a space — Picard/Foobar convention).
-    # Default: store the original "feat./&" string verbatim.
-    # With title-feat extraction: "Primary feat. X & Y".
-    display_target = original_display
-    if title_featured_fmt:
-        if FEAT_RE.search(original_display):
-            # ARTIST field already carries a feat. credit; keep its
-            # display string but ensure title-derived names are visible.
-            # (ARTIST values above already merged both sources.)
-            pass
-        else:
-            display_target = (
-                f"{original_display} feat. {' & '.join(title_featured_fmt)}"
-            )
-    current_display = list(audio.tags.get("DISPLAY ARTIST", []))
+    # Keep a curated existing value, but rebuild it as "A, B & C"
+    # when it is missing, still contains raw ";" / "//" separators, or
+    # merely repeats one artist from a multi-artist track (the old bug).
+    current_display = get_tag_values(audio, "DISPLAY ARTIST")
+    artist_keys = {p.lower() for p in new_artist_values}
+    curated_display = (
+        len(current_display) == 1
+        and current_display[0].strip()
+        and not SEMICOLON_RE.search(current_display[0])
+        and EDIT_SEP not in current_display[0]
+        and not (len(new_artist_values) > 1
+                 and current_display[0].strip().lower() in artist_keys)
+    )
+    if curated_display:
+        display_target = current_display[0].strip()
+    else:
+        display_target = format_display(formatted_primary,
+                                        formatted_featured)
+    if title_featured and not FEAT_RE.search(display_target):
+        display_target = (
+            f"{display_target} feat. {join_display(title_featured)}"
+        )
     if len(current_display) != 1 or current_display[0] != display_target:
         changes["DISPLAY ARTIST"] = [display_target]
+
+    # REMIXER / TPE4: keep existing names and add those from the title.
+    current_remixers = get_tag_values(audio, "REMIXER")
+    if remixer_fmt:
+        seen = {r.lower() for r in current_remixers}
+        new_remixers = list(current_remixers)
+        for name in remixer_fmt:
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                new_remixers.append(name)
+        if new_remixers != current_remixers:
+            changes["REMIXER"] = new_remixers
 
     if new_title_values is not None:
         changes["TITLE"] = new_title_values
 
     # ALBUMARTIST: if multi-artist track, join with separator.
-    albumartist_values = list(audio.tags.get("ALBUMARTIST", []))
+    albumartist_values = get_tag_values(audio, "ALBUMARTIST")
     if albumartist_values and len(new_artist_values) > 1:
         aa_parts = []
         for v in albumartist_values:
@@ -292,7 +570,7 @@ def plan_changes(audio, overrides: dict[str, str],
 
 def apply_changes(audio, changes: dict) -> None:
     for key, values in changes.items():
-        audio.tags[key] = values
+        set_tag_values(audio, key, values)
     audio.save()
 
 
@@ -387,10 +665,9 @@ def write_tags(path: Path, snapshot: dict[str, list[str]],
     if audio is None or audio.tags is None:
         return False
     for key, values in snapshot.items():
-        audio.tags[key] = values
+        set_tag_values(audio, key, values)
     for key in delete or set():
-        if key in audio.tags:
-            del audio.tags[key]
+        delete_tag(audio, key)
     audio.save()
     return True
 
@@ -410,7 +687,11 @@ def cmd_view(paths: list[Path]) -> int:
 
 def cmd_fix(paths: list[Path], apply: bool, albumartist_sep: str,
             extract_feat_from_title: bool = False) -> int:
-    overrides = load_overrides()
+    try:
+        overrides = load_overrides()
+    except ValueError as exc:
+        print(f"[error] {exc}", file=sys.stderr)
+        return 1
     files = []
     for p in paths:
         if p.is_dir():
@@ -466,11 +747,16 @@ def main(argv: list[str]) -> int:
                        help="Write changes back to files")
     fix_p.add_argument("--albumartist-sep", default=" ; ",
                        help="Separator used in ALBUMARTIST for multi-artist tracks")
-    fix_p.add_argument("--extract-feat-from-title", action="store_true",
+    fix_p.add_argument("--extract-feat-from-title",
+                       "--extract-title-credits",
+                       dest="extract_feat_from_title",
+                       action="store_true",
                        help="Move '(feat. X)'/'(ft. X)' from TITLE into "
-                            "ARTIST (extra values) and DISPLAY ARTIST "
-                            "('Primary feat. X'), and strip it from TITLE. "
-                            "Off by default.")
+                            "ARTIST and DISPLAY ARTIST and strip them "
+                            "from TITLE. Remix credits like "
+                            "'(DJ X Remix)'/'[DJ X Remix]' only fill "
+                            "REMIXER (TPE4 for MP3); TITLE and DISPLAY "
+                            "ARTIST are left untouched. Off by default.")
 
     args = parser.parse_args(argv)
     if args.cmd == "view":

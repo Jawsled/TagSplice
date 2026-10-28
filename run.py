@@ -31,7 +31,8 @@ GUI_DEPS = ["mutagen", "PySide6", "tkinterdnd2"]
 CLI_DEPS = ["mutagen"]
 
 # Tags always shown in the GUI grid, in this order.
-GUI_TRACKED_TAGS = ["TITLE", "ARTIST", "DISPLAY ARTIST", "ALBUMARTIST"]
+GUI_TRACKED_TAGS = ["TITLE", "ARTIST", "DISPLAY ARTIST", "REMIXER",
+                    "ALBUMARTIST"]
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +197,108 @@ def _qt_main() -> int:
     from PySide6.QtCore import Qt
     from PySide6.QtGui import QAction
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QFileDialog, QHBoxLayout, QHeaderView,
-        QLabel, QListWidget, QListWidgetItem, QMainWindow, QPushButton,
-        QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+        QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
+        QHBoxLayout, QHeaderView, QLabel, QListWidget, QListWidgetItem,
+        QMainWindow, QMessageBox, QPushButton, QSplitter, QTableWidget,
+        QTableWidgetItem, QVBoxLayout, QWidget,
     )
 
-    overrides = tagsplice.load_overrides()
+    overrides: dict[str, str] = {}
     ALBUMARTIST_SEP = " ; "
+
+    class OverridesDialog(QDialog):
+        """Two-column editor for the artist overrides in overrides.json."""
+
+        def __init__(self, parent: QWidget,
+                     rules: dict[str, str]) -> None:
+            super().__init__(parent)
+            self.setWindowTitle("Artist overrides")
+            self.resize(660, 440)
+
+            layout = QVBoxLayout(self)
+            info = QLabel(
+                "Map an artist name as written in your tags to the exact "
+                "text TagSplice should write. Matching ignores case.\n"
+                f"Saved to {tagsplice.OVERRIDES_PATH}")
+            info.setWordWrap(True)
+            layout.addWidget(info)
+
+            self.table = QTableWidget(0, 2)
+            self.table.setHorizontalHeaderLabels(
+                ["Artist in tags", "Display as"])
+            self.table.verticalHeader().setVisible(False)
+            self.table.setSelectionBehavior(
+                QTableWidget.SelectionBehavior.SelectRows)
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(
+                0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(
+                1, QHeaderView.ResizeMode.Stretch)
+            layout.addWidget(self.table, 1)
+
+            for key, value in sorted(rules.items(),
+                                     key=lambda kv: kv[0].lower()):
+                self._add_row(key, value)
+
+            row_btns = QHBoxLayout()
+            add_btn = QPushButton("Add rule")
+            remove_btn = QPushButton("Remove selected")
+            add_btn.clicked.connect(self._add_blank_row)
+            remove_btn.clicked.connect(self._remove_selected)
+            row_btns.addWidget(add_btn)
+            row_btns.addWidget(remove_btn)
+            row_btns.addStretch(1)
+            layout.addLayout(row_btns)
+
+            box = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save
+                | QDialogButtonBox.StandardButton.Cancel)
+            box.accepted.connect(self._save)
+            box.rejected.connect(self.reject)
+            layout.addWidget(box)
+
+        def _add_row(self, key: str = "", value: str = "") -> None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(key))
+            self.table.setItem(row, 1, QTableWidgetItem(value))
+
+        def _add_blank_row(self) -> None:
+            self._add_row()
+            row = self.table.rowCount() - 1
+            self.table.setCurrentCell(row, 0)
+            self.table.editItem(self.table.item(row, 0))
+
+        def _remove_selected(self) -> None:
+            rows = sorted({i.row() for i in self.table.selectedIndexes()},
+                          reverse=True)
+            if not rows:
+                row = self.table.currentRow()
+                rows = [row] if row >= 0 else []
+            for row in rows:
+                self.table.removeRow(row)
+
+        def _collect_rules(self) -> dict[str, str]:
+            rules: dict[str, str] = {}
+            for row in range(self.table.rowCount()):
+                key_item = self.table.item(row, 0)
+                value_item = self.table.item(row, 1)
+                key = key_item.text().strip() if key_item else ""
+                value = value_item.text().strip() if value_item else ""
+                if not key and not value:
+                    continue
+                if key in rules:
+                    raise ValueError(f'Duplicate rule for "{key}".')
+                rules[key] = value
+            return rules
+
+        def _save(self) -> None:
+            try:
+                tagsplice.save_override_rules(self._collect_rules())
+            except ValueError as exc:
+                QMessageBox.warning(self, "Artist overrides", str(exc))
+                return
+            self.accept()
 
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -215,6 +311,7 @@ def _qt_main() -> int:
             self.results: list[dict] = []
             self.apply_mode = True
             self.extract_feat = False
+            self.overrides_error: str | None = None
             # path -> {tags: snapshot, added: set of tags we wrote}
             self.undo_backups: dict[Path, dict] = {}
 
@@ -228,12 +325,17 @@ def _qt_main() -> int:
             self.preview_btn = QPushButton("Preview")
             self.apply_chk = QCheckBox("Apply (uncheck for dry-run)")
             self.apply_chk.setChecked(True)
-            self.feat_chk = QCheckBox("Extract feat. from TITLE")
+            self.feat_chk = QCheckBox("Extract feat. / tag remixer from TITLE")
             self.feat_chk.setChecked(False)
             self.feat_chk.setToolTip(
                 "Optional, non-mainstream: move '(feat. X)'/'(ft. X)' "
-                "from TITLE into ARTIST (extra values) and DISPLAY ARTIST "
-                "('Primary feat. X'), and strip it from TITLE.")
+                "from TITLE into ARTIST and DISPLAY ARTIST. Remix "
+                "credits like '(DJ X Remix)'/'[DJ X Remix]' only fill "
+                "REMIXER; TITLE and DISPLAY ARTIST stay untouched.")
+            self.overrides_btn = QPushButton("Overrides…")
+            self.overrides_btn.setToolTip(
+                "Add or edit artist name overrides stored in "
+                "overrides.json (shared with the CLI).")
             self.apply_btn = QPushButton("Apply")
             self.undo_btn = QPushButton("Undo")
             self.undo_btn.setEnabled(False)
@@ -244,6 +346,7 @@ def _qt_main() -> int:
             toolbar.addSpacing(12)
             toolbar.addWidget(self.apply_chk)
             toolbar.addWidget(self.feat_chk)
+            toolbar.addWidget(self.overrides_btn)
             toolbar.addWidget(self.apply_btn)
             toolbar.addWidget(self.undo_btn)
             toolbar.addWidget(self.clear_btn)
@@ -291,6 +394,7 @@ def _qt_main() -> int:
             self.preview_btn.clicked.connect(self.on_preview)
             self.apply_chk.toggled.connect(lambda v: setattr(self, "apply_mode", v))
             self.feat_chk.toggled.connect(self.on_feat_toggled)
+            self.overrides_btn.clicked.connect(self.on_edit_overrides)
             self.apply_btn.clicked.connect(self.on_apply)
             self.undo_btn.clicked.connect(self.on_undo)
             self.clear_btn.clicked.connect(self.on_clear)
@@ -347,7 +451,34 @@ def _qt_main() -> int:
             else:
                 event.ignore()
 
+        def _reload_overrides(self) -> None:
+            """Pick up overrides.json edits made here or by hand."""
+            try:
+                fresh = tagsplice.load_overrides()
+            except ValueError as exc:
+                self.overrides_error = str(exc)
+                return
+            overrides.clear()
+            overrides.update(fresh)
+            self.overrides_error = None
+
+        def on_edit_overrides(self) -> None:
+            try:
+                rules = tagsplice.load_override_rules()
+            except ValueError as exc:
+                rules = {}
+                QMessageBox.warning(
+                    self, "Artist overrides",
+                    f"{exc}\n\nStarting from an empty list.")
+            dlg = OverridesDialog(self, rules)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            self.refresh_list()
+            self.status.setText(
+                f"Saved {len(overrides)} override rule(s).")
+
         def refresh_list(self) -> None:
+            self._reload_overrides()
             files = tagsplice.collect_files(self.targets)
             self.results = [tagsplice.plan_file(
                 f, overrides, ALBUMARTIST_SEP, self.extract_feat)
@@ -367,11 +498,15 @@ def _qt_main() -> int:
             if self.file_list.count():
                 self.file_list.selectAll()
                 self.file_list.setCurrentRow(0)
-            self.status.setText(
-                f"{len(files)} file(s). "
-                f"{sum(1 for r in self.results if r.get('changes'))} need changes. "
-                f"{len(self.file_list.selectedIndexes())} selected."
-            )
+            if self.overrides_error:
+                status = f"Overrides not loaded: {self.overrides_error}"
+            else:
+                status = (
+                    f"{len(files)} file(s). "
+                    f"{sum(1 for r in self.results if r.get('changes'))} "
+                    f"need changes. "
+                    f"{len(self.file_list.selectedIndexes())} selected.")
+            self.status.setText(status)
             if self.file_list.count():
                 self.file_list.setCurrentRow(0)
             self._update_undo_button()
@@ -544,7 +679,8 @@ class TkApp:
     def __init__(self, root: "tk.Tk") -> None:
         from tkinter import ttk
 
-        self.overrides = tagsplice.load_overrides()
+        self.overrides: dict[str, str] = {}
+        self.overrides_error: str | None = None
         self.albumartist_sep = " ; "
 
         self.targets: list[Path] = []
@@ -584,9 +720,12 @@ class TkApp:
                    command=self.refresh_list).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Checkbutton(toolbar, text="Apply (uncheck for dry-run)",
                         variable=self.apply_var).pack(side=tk.LEFT, padx=12)
-        ttk.Checkbutton(toolbar, text="Extract feat. from TITLE",
+        ttk.Checkbutton(toolbar, text="Extract feat. / tag remixer from TITLE",
                         variable=self.extract_feat_var,
                         command=self._on_feat_toggled).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="Overrides…",
+                   command=self.on_edit_overrides).pack(side=tk.LEFT,
+                                                        padx=(6, 0))
         self.apply_btn = ttk.Button(toolbar, text="Apply",
                                     command=self.on_apply)
         self.apply_btn.pack(side=tk.LEFT)
@@ -727,6 +866,7 @@ class TkApp:
         return [p for p in paths if p]
 
     def refresh_list(self) -> None:
+        self._reload_overrides()
         files = tagsplice.collect_files(self.targets)
         self.results = [tagsplice.plan_file(f, self.overrides,
                                             self.albumartist_sep,
@@ -759,10 +899,41 @@ class TkApp:
         if self.targets:
             self.refresh_list()
 
+    def _reload_overrides(self) -> None:
+        """Pick up overrides.json edits made here or by hand."""
+        try:
+            fresh = tagsplice.load_overrides()
+        except ValueError as exc:
+            self.overrides_error = str(exc)
+            return
+        self.overrides.clear()
+        self.overrides.update(fresh)
+        self.overrides_error = None
+
+    def on_edit_overrides(self) -> None:
+        try:
+            rules = tagsplice.load_override_rules()
+        except ValueError as exc:
+            messagebox.showwarning(
+                "Artist overrides",
+                f"{exc}\n\nStarting from an empty list.",
+                parent=self.root)
+            rules = {}
+        dlg = TkOverridesDialog(self, rules)
+        if not dlg.show():
+            return
+        self.refresh_list()
+        self.status_var.set(
+            f"Saved {len(self.overrides)} override rule(s).")
+
     def _refresh_status(self) -> None:
         sel_count = len(self.file_list.curselection())
         if not self.file_list.curselection() and self.file_list.size():
             sel_count = self.file_list.size()
+        if self.overrides_error:
+            self.status_var.set(
+                f"Overrides not loaded: {self.overrides_error}")
+            return
         self.status_var.set(
             f"{self.file_list.size()} file(s). "
             f"{sum(1 for r in self.results if r.get('changes'))} need changes. "
@@ -960,6 +1131,177 @@ class TkApp:
         self._set_edit_target(None, None, "")
         self.status_var.set("Ready.")
         self._update_undo_button()
+
+
+class TkOverridesDialog:
+    """Modal editor for the artist overrides stored in overrides.json."""
+
+    def __init__(self, app: "TkApp", rules: dict[str, str]) -> None:
+        from tkinter import ttk
+
+        self.app = app
+        self.saved = False
+        self._loading = False
+        self._next_id = 0
+
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Artist overrides")
+        self.win.transient(app.root)
+        self.win.geometry("680x480")
+        self.win.minsize(560, 400)
+
+        ttk.Label(
+            self.win,
+            text=("Map an artist name as written in your tags to the "
+                  "exact text TagSplice should write. Matching ignores "
+                  f"case.\nSaved to: {tagsplice.OVERRIDES_PATH}"),
+            justify=tk.LEFT, padding=(10, 8),
+        ).pack(side=tk.TOP, fill=tk.X)
+
+        body = ttk.Frame(self.win, padding=(10, 0))
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self.tree = ttk.Treeview(body, columns=("artist", "display"),
+                                 show="headings", height=10)
+        self.tree.heading("artist", text="Artist in tags")
+        self.tree.heading("display", text="Display as")
+        self.tree.column("artist", width=280, anchor=tk.W)
+        self.tree.column("display", width=280, anchor=tk.W)
+        scroll = ttk.Scrollbar(body, orient=tk.VERTICAL,
+                               command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        edit = ttk.Frame(self.win, padding=(10, 8))
+        edit.pack(fill=tk.X)
+        edit.columnconfigure(1, weight=1)
+        ttk.Label(edit, text="Artist in tags", width=14,
+                  anchor=tk.W).grid(row=0, column=0, sticky=tk.W)
+        self.key_var = tk.StringVar(self.win)
+        self.key_entry = ttk.Entry(edit, textvariable=self.key_var)
+        self.key_entry.grid(row=0, column=1, sticky=tk.EW)
+        ttk.Label(edit, text="Display as", width=14,
+                  anchor=tk.W).grid(row=1, column=0, sticky=tk.W,
+                                    pady=(4, 0))
+        self.value_var = tk.StringVar(self.win)
+        ttk.Entry(edit, textvariable=self.value_var).grid(
+            row=1, column=1, sticky=tk.EW, pady=(4, 0))
+        ttk.Label(
+            edit,
+            text="Select a rule to edit it, or start typing to add one.",
+            foreground="gray",
+        ).grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+
+        actions = ttk.Frame(self.win, padding=(10, 6))
+        actions.pack(fill=tk.X)
+        ttk.Button(actions, text="Add rule",
+                   command=self._add_rule).pack(side=tk.LEFT)
+        ttk.Button(actions, text="Remove selected",
+                   command=self._remove_selected).pack(
+                       side=tk.LEFT, padx=(6, 0))
+        ttk.Button(actions, text="Cancel",
+                   command=self.win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Save",
+                   command=self._save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        self.key_var.trace_add("write", self._on_field_changed)
+        self.value_var.trace_add("write", self._on_field_changed)
+
+        for key, value in sorted(rules.items(),
+                                 key=lambda kv: kv[0].lower()):
+            self._insert_rule(key, value)
+        first = self.tree.get_children()
+        if first:
+            self.tree.selection_set(first[0])
+            self.tree.focus(first[0])
+
+        self.win.protocol("WM_DELETE_WINDOW", self.win.destroy)
+        self.win.bind("<Escape>", lambda _e: self.win.destroy())
+
+    def _insert_rule(self, key: str, value: str) -> str:
+        self._next_id += 1
+        iid = f"rule{self._next_id}"
+        self.tree.insert("", tk.END, iid=iid, values=(key, value))
+        return iid
+
+    def _on_select(self, _evt=None) -> None:
+        sel = self.tree.selection()
+        if not sel:
+            return
+        values = self.tree.item(sel[0], "values")
+        self._loading = True
+        try:
+            self.key_var.set(str(values[0]) if len(values) > 0 else "")
+            self.value_var.set(str(values[1]) if len(values) > 1 else "")
+        finally:
+            self._loading = False
+
+    def _on_field_changed(self, *_args) -> None:
+        if self._loading:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            # Typing with nothing selected starts a new rule.
+            if not self.key_var.get() and not self.value_var.get():
+                return
+            iid = self._insert_rule("", "")
+            self.tree.selection_set(iid)
+            self.tree.focus(iid)
+            self.tree.item(iid, values=(self.key_var.get(),
+                                        self.value_var.get()))
+            return
+        if not self.tree.exists(sel[0]):
+            return
+        self.tree.item(sel[0], values=(self.key_var.get(),
+                                       self.value_var.get()))
+
+    def _add_rule(self) -> None:
+        iid = self._insert_rule("", "")
+        self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        self.tree.see(iid)
+        self._on_select()
+        self.key_entry.focus_set()
+
+    def _remove_selected(self) -> None:
+        for iid in self.tree.selection():
+            self.tree.delete(iid)
+        self._loading = True
+        try:
+            self.key_var.set("")
+            self.value_var.set("")
+        finally:
+            self._loading = False
+
+    def _collect_rules(self) -> dict[str, str]:
+        rules: dict[str, str] = {}
+        for iid in self.tree.get_children():
+            values = self.tree.item(iid, "values")
+            key = str(values[0]).strip() if len(values) > 0 else ""
+            value = str(values[1]).strip() if len(values) > 1 else ""
+            if not key and not value:
+                continue
+            if key in rules:
+                raise ValueError(f'Duplicate rule for "{key}".')
+            rules[key] = value
+        return rules
+
+    def _save(self) -> None:
+        try:
+            tagsplice.save_override_rules(self._collect_rules())
+        except ValueError as exc:
+            messagebox.showerror("Artist overrides", str(exc),
+                                 parent=self.win)
+            return
+        self.saved = True
+        self.win.destroy()
+
+    def show(self) -> bool:
+        self.win.grab_set()
+        self.win.wait_window()
+        return self.saved
 
 
 def _tk_main() -> int:
